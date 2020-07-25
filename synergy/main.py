@@ -2,9 +2,12 @@ import aioredis
 import json
 import logging.config
 import sys
+import time
+import uuid
 
 from aiohttp_requests import requests
-from quart import Quart, request
+from hashlib import sha256
+from quart import Quart, request, redirect
 
 # setup
 import settings
@@ -14,14 +17,31 @@ app = Quart(__name__)
 # api
 @app.route('/go')
 async def go():
-    # When called, app grabs cookies, checks for a logged in user, extracts org name, makes hash of (user|org|timestamp|nonce) and stores all in redis for TIMEOUT seconds, sends user to redirect with hash as URL param /_sso/chk?_h={hash}
     redis_pool = await aioredis.create_pool((settings.redis_host, settings.redis_port), db=settings.redis_db)
     cookies = {}
-    for kk in settings.dest_cookies:
+    for kk in settings.source_cookies:
         vv = request.cookies.get(kk) 
         if vv: cookies[kk] = vv
-    resp = await requests.get(settings.dest_url, cookies=cookies)
-    return "go"
+    #app.logger.debug(f"cookies: {cookies}")
+    resp = await requests.get(settings.source_auth_url, cookies=cookies, timeout=settings.source_timeout)
+    _data = await resp.text()
+    #app.logger.debug(f"resp: {resp.status} {_data}")
+    if resp.status in settings.source_success_codes:
+        key = request.args.get('_k')
+        if key:
+            nonce = str(uuid.uuid4())
+            ts = time.gmtime()
+            data = json.dumps({
+                'nonce': nonce,
+                'key': key,
+                'ts': ts,
+            })
+            ticket = sha256(data.encode()).hexdigest()
+            await redis_pool.execute("setex", f"{settings.redis_prefix}{ticket}", settings.redis_timeout, data) 
+            redirect_url = settings.source_redirect_url.replace(settings.source_redirect_key, key)
+            return redirect(f"{redirect_url}?_t={ticket}")
+    app.logger.warn(json.dumps({"message": "Synergy auth error"}))
+    return ('', 403)
 
 @app.route('/chk')
 async def check():
